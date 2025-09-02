@@ -1,6 +1,6 @@
 import { Routes, Route } from "react-router";
 import UploadPage from "./pages/upload";
-import ReviewPage from "./pages/Review";
+import ReviewPage from "./pages/review";
 
 export default function Router() {
     return(
