@@ -15,23 +15,9 @@ export type ReviewData = {
 };
 
 export const ReviewService = {
-    getReview: async () => {
-        try {
-            const response = await api.get('/review');
-            return response.data;
-   
-        } catch (error) {
-            console.error("Erro ao buscar os dados:", error);
-            throw error;
-        }
-    },
-
     submitReview: async (payload:ReviewData) => {
         try {
-            const response = await api.post('/review',payload, {  
-                responseType: 'blob', // Importante para receber arquivos binários
-            }
-            );
+            const response = await api.post('/review',payload);
             return response.data;
         } catch (error) {
             console.error("Erro ao gerar o arquivo ODT:", error);
