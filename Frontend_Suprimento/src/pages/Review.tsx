@@ -51,7 +51,9 @@ function ReviewPage() {
 
     const location = useLocation();
     const receivedData = location.state?.formData as ProcessedData | undefined;
-        const [downloadData, setDownloadData] = useState<{ filename: string; showModal: boolean } | null>(null);
+    const [downloadData, setDownloadData] = useState<{ filename: string; showModal: boolean } | null>(null);
+
+
 
     // Definição do formulário
     const form = useForm<z.infer<typeof formSchema>>({//Conectando o zod com o react-hook-form
@@ -118,12 +120,15 @@ function ReviewPage() {
             });
 
         toast.success("Dados enviados com sucesso!");
-
-    } catch (error) {
+    } 
+    catch (error) {
         toast.error("Erro ao enviar os dados para o servidor.");    
-    }
-     
-  };
+     }  
+    };
+    
+
+
+
     return ( 
         <>
            

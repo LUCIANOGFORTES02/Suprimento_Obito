@@ -10,42 +10,59 @@ import {
 } from "@/components/ui/dialog"
 import { Download, Loader2 } from "lucide-react";
 import { useState } from "react";
-import { useNavigate } from "react-router";
+import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 
 interface DownloadPageProps{
     filename:string
     onClose:()=>void
+    onRestart?:()=>void
 
-}
+};
+type DownloadState = "idle" | "downloading" | "downloaded" | "error";
 
-function DownloadPage({filename,onClose }:DownloadPageProps) {//Tem que recerber como prop o link do arquivo gerado
+
+function DownloadPage({filename,onClose,onRestart }:DownloadPageProps) {//Tem que recerber como prop o link do arquivo gerado
     const navigate = useNavigate();
-    const [isDownloading, setIsDownloading] = useState(false);
+    const [state, setState] = useState<DownloadState>("idle");
+
+
 
     const handleDownload = async () => {
-        setIsDownloading(true); 
+        if (state === "downloading") return; // ✅ evita duplo clique
+        setState("downloading"); 
         try {
             const success = await DownloadService.downloadFile(filename);
             if (success) {
-               toast.success('Download finalizado!.',{
+                setState("downloaded");
+                toast.success('Download finalizado!.',{
                 action: {
-                    label: 'Novo PDF',
-                    onClick: () => navigate('/upload')    
+                    label: 'Novo upload',
+                    onClick: () => {
+                        onClose();
+                        if(onRestart){
+                            onRestart();
+                        }
+                        else  {
+                            navigate('/upload')
+                        }  
+
+                     }
             }, 
         });
-        }  
-        onClose();    
-            return success;
+        return true;
+        
+        }  else {
+            setState("error");
+            toast.error('Não foi possível baixar o arquivo.');
+            return false;
+        };
 
         }
         catch (error) {
             toast.error('Erro ao baixar o arquivo');
 
             console.error("Erro ao baixar o arquivo:", error);
-        }
-        finally {
-            setIsDownloading(false); 
         }
 
 
@@ -54,7 +71,7 @@ function DownloadPage({filename,onClose }:DownloadPageProps) {//Tem que recerber
     return (
         <>
             <Dialog open={true} onOpenChange={(open)=>!open && onClose()} >
-                <DialogContent className="sm:max-w-[425px]">
+                <DialogContent onInteractOutside={(e) => e.preventDefault()} className="sm:max-w-[425px]">
                     <DialogHeader>
                         <DialogTitle>Download do Arquivo</DialogTitle>
                         <DialogDescription>
@@ -62,10 +79,11 @@ function DownloadPage({filename,onClose }:DownloadPageProps) {//Tem que recerber
                         </DialogDescription>
                     </DialogHeader>
                     <DialogFooter className="flex flex-row gap-2 items-center justify-center">
+                        {state !== "downloaded" &&(
                         <Button  onClick={handleDownload}
-                            disabled={isDownloading}
+                            disabled={state === "downloading"}
                             >
-                            {isDownloading ? (
+                            {state === "downloading" ? (
                                 <>
                                 <Loader2 className="h-4 w-4 animate-spin" />
                                 </>
@@ -74,11 +92,21 @@ function DownloadPage({filename,onClose }:DownloadPageProps) {//Tem que recerber
                                 <Download className="h-4 w-4" />
                                 </>
                             )}
-                            Download ODT
+                           <span className="ml-2">
+                                {state === "downloading" ? "Baixando..." : "Download ODT"}
+                            </span>
+                               
                         </Button>
-                            <Button variant="outline" onClick={onClose}>
+                            )}
+                  
+                        {state === "downloaded" && (
+                        <Button  onClick={ () => window.location.replace("/")}>
+                            Enviar outro arquivo
+                        </Button> )}
+                        
+                        <Button variant="outline" onClick={onClose}>
                             Fechar
-                            </Button>
+                        </Button>
                     </DialogFooter>
                 </DialogContent>
             </Dialog>

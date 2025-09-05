@@ -2,6 +2,9 @@ import { Button } from "@/components/ui/button";
 import { FileUp  } from "lucide-react";
 import { useRef, useState } from "react";
 import { toast } from "sonner";
+import { UploadService } from "@/api/uploadService";
+import {  useNavigate } from "react-router-dom";
+
 
 
 
@@ -119,7 +122,7 @@ function UploadPage() {
 
                         </div>
 
-                    <Button onClick={handleUpload} className="mt-4" disabled={status === "uploading"}>
+                    <Button onClick={handleUpload} className="mt-4" disabled={isUploading}>
                         Upload
                     </Button>   
                 </>
@@ -133,7 +136,5 @@ function UploadPage() {
         </>
     );
 }
-import { UploadService } from "@/api/uploadService";
-import { Link, useNavigate } from "react-router";
 
 export default UploadPage;
