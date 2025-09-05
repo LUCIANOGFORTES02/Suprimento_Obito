@@ -76,10 +76,11 @@ odt_generator = ODTGenerator()
 @app.post("/review")
 async def review(data: ReviewData):
     try:
+        print(f"📥 Recebido review data: {data.dict()}")
 
-        print(f"Dados recebidos no backend: {data.dict()}")
         #Gerar o documento ODT aqui usando os dados recebidos
         outh_path=odt_generator.generate_from_template(data.dict())
+        print(f"✅ Documento gerado com sucesso: {outh_path}")
         #Prepara resposta com URL para download
         response = odt_generator.create_download_response(outh_path)
 

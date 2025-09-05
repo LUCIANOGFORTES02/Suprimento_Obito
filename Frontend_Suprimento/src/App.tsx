@@ -13,7 +13,11 @@ function App() {
       <Header/>
       <Router/>
    </BrowserRouter>
-   <Toaster/>
+   <Toaster
+   position='top-left'
+   closeButton
+   
+   />
     </>
   )
 }

@@ -51,7 +51,7 @@ function ReviewPage() {
 
     const location = useLocation();
     const receivedData = location.state?.formData as ProcessedData | undefined;
-
+        const [downloadData, setDownloadData] = useState<{ filename: string; showModal: boolean } | null>(null);
 
     // Definição do formulário
     const form = useForm<z.infer<typeof formSchema>>({//Conectando o zod com o react-hook-form
@@ -112,7 +112,10 @@ function ReviewPage() {
         };
         console.log("Enviando de volta para o backend somente os campos:",receivedData)
         const response = await ReviewService.submitReview(reviewData);
-        //Receber o download do arquivo ODT
+        setDownloadData({
+                filename: response.filename,
+                showModal: true
+            });
 
         toast.success("Dados enviados com sucesso!");
 
@@ -299,7 +302,12 @@ function ReviewPage() {
             </Form>
         </Card>
 
-        <DownloadPage />
+        {downloadData?.showModal && (
+                <DownloadPage 
+                    filename={downloadData.filename} 
+                    onClose={() => setDownloadData(null)}
+                />
+            )}
 
         </>
      );
