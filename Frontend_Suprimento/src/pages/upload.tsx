@@ -4,10 +4,12 @@ import { useRef, useState } from "react";
 import { toast } from "sonner";
 
 
-function UploadPage() {
 
+function UploadPage() {
+    const navigate = useNavigate();
+   
     const [file, setFile] = useState<File| null>(null);
-    const [status, setStatus] = useState<"Success"| "uploading"| null>(null);
+    const[isUploading, setIsUploading] = useState(false)
     const fileInputRef = useRef<HTMLInputElement>(null);//Simula o clique no input file
 
     function handleFileChange(event: React.ChangeEvent<HTMLInputElement>) {
@@ -29,35 +31,34 @@ function UploadPage() {
 
     async function handleUpload() {
         if (!file) return;  
-
-        setStatus("uploading");
-        const formData = new FormData();
-        formData.append('file', file);
-
- 
-
         
+        setIsUploading(true);
+          const toastId = toast.loading('Processando PDF, aguarde ...')
         // Chama o endpoint de upload
         try {
-            await UploadService.uploadFile(formData);;
-      }
-      catch (error) {
-            console.error('Erro ao enviar o arquivo:', error);
-            toast.error('Erro ao enviar o arquivo.');
-      }
-      finally{
-        setStatus("Success");
-        toast.success("Upload realizado com sucesso!");
-      // Resetar o estado após o upload
-        setFile(null);
-        if (fileInputRef.current) {
-            fileInputRef.current.value = '';
+        const response =    await UploadService.uploadFile(file);
+        if (response.success && response.data) {
+            toast.success('PDF processado com sucesso!',{id:toastId})
+            navigate('review', {state: {formData: response.data}});
         }
-        setStatus(null);
+        else {
+            toast.error("Falha ao extrair dados do PDF.",{id:toastId});  
+        }
 
       }
-
-        
+        catch (error) {
+            console.error('Erro ao enviar o arquivo:', error);
+            toast.error('Erro ao enviar o arquivo.',{id:toastId});
+        }
+        finally{
+            // toast.success("Upload realizado com sucesso!");
+            // Resetar o estado após o upload
+            setIsUploading(false)
+            setFile(null);
+            if (fileInputRef.current) {
+                fileInputRef.current.value = '';
+            }
+      }  
 
     }
 
@@ -98,7 +99,7 @@ function UploadPage() {
                 </div>
                
                 
-            {/* Informaçãoes do arquivo +  Upload do arquivo*/}
+            {/* Informações do arquivo +  Upload do arquivo*/}
 
             <div className="flex flex-col  items-center">
                 {file && (
@@ -133,5 +134,6 @@ function UploadPage() {
     );
 }
 import { UploadService } from "@/api/uploadService";
+import { Link, useNavigate } from "react-router";
 
 export default UploadPage;

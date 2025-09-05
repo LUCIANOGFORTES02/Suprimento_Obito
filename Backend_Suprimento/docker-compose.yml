@@ -1,0 +1,14 @@
+version: "3.9"
+services:
+  api:
+    image: suprimento
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/app
+    volumes:
+      - ./app:/app/app
+      # - ./data:/data                  # persiste uploads/saídas (ODT) no host
+
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
