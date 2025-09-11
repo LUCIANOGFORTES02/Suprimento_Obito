@@ -6,7 +6,7 @@ import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { ArrowLeft } from 'lucide-react';
-import { Link, useLocation } from "react-router";
+import { Link, useLocation } from "react-router-dom";
 import { ReviewService, type ReviewData } from "@/api/reviewService";
 import type { ProcessedData } from "@/api/uploadService";
 import { useEffect, useState } from "react";
@@ -14,15 +14,44 @@ import { toast } from "sonner";
 import DownloadPage from "./download";
 
 
-const parseCertidoes = (text: string): string[] => {
-  // divide por vírgula OU ponto e vírgula, trim, remove vazios, remove duplicados
-    const items = text
-        .split(/[;,]/)
-        .map(s => s.trim())
-        .filter(Boolean);
+type CertItem = {
+  pdf_page?: number;
+  rodape?: string;
+  num?: string | number;
+  pag?: string | number;
+} | string;
 
-    return  Array.from(new Set(items));
+const coerceCertidoesToStrings = (raw: unknown): string[] => {
+  if (typeof raw === "string") {
+    // já no formato "Num. ... - Pág. ..." separados por vírgula/; ou \n
+    return parseCertidoes(raw);
+  }
+  if (Array.isArray(raw)) {
+    return (raw as CertItem[])
+      .map((it) => {
+        if (typeof it === "string") return it.trim();
+        if (!it) return "";
+        if (it.rodape && typeof it.rodape === "string") return it.rodape.trim();
+        if (it.num != null) {
+          const num = String(it.num).trim();
+          const pag = it.pag != null ? String(it.pag).trim() : "";
+          return `Num. ${num} - Pág. ${pag}`.trim();
+        }
+        return "";
+      })
+      .filter(Boolean);
+  }
+  return [];
 };
+
+const parseCertidoes = (text: string): string[] => {
+  const items = text
+    .split(/[;,\n]/) // vírgula, ; ou quebra de linha
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return Array.from(new Set(items));
+};
+
 
 //Criando um esquema de formulário
 const formSchema = z.object({
@@ -67,9 +96,7 @@ function ReviewPage() {
             data: receivedData.data,
             id_parecer: receivedData.id_parecer,
             id_declaracao: receivedData.id_declaracao,
-            id_certidoes: Array.isArray(receivedData.id_certidoes) 
-                ? receivedData.id_certidoes.join(', ')
-                : receivedData.id_certidoes || "",
+            id_certidoes: coerceCertidoesToStrings(receivedData.id_certidoes).join(", "),
         } : {
             numero_processo: "",
             requerente: "",
@@ -95,9 +122,8 @@ function ReviewPage() {
                 data: receivedData.data,
                 id_parecer: receivedData.id_parecer,
                 id_declaracao: receivedData.id_declaracao,
-                id_certidoes: Array.isArray(receivedData.id_certidoes) 
-                    ? receivedData.id_certidoes.join(', ')
-                    : receivedData.id_certidoes || "",
+                id_certidoes: coerceCertidoesToStrings(receivedData.id_certidoes).join(", "),
+
             });
         }
     }, [receivedData, form]);
@@ -112,7 +138,7 @@ function ReviewPage() {
             ...values,
             id_certidoes: parseCertidoes(values.id_certidoes),
         };
-        console.log("Enviando de volta para o backend somente os campos:",receivedData)
+        console.log("Enviando de volta para o backend somente os campos:", reviewData);
         const response = await ReviewService.submitReview(reviewData);
         setDownloadData({
                 filename: response.filename,
@@ -273,6 +299,7 @@ function ReviewPage() {
                                 <FormItem className="md:col-span-2">
                                 <FormLabel>Certidões</FormLabel>
                                 <FormControl>
+
                                     <Input placeholder="Separe as certidões por vírgula ou ponto e vírgula (ex.: Num. 72323682 - Pág. 3 , Num. 7232554 - Pág. 2)" {...field} />
                                 </FormControl>
                                 <FormMessage />
