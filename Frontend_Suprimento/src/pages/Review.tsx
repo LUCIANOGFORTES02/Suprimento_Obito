@@ -161,7 +161,7 @@ function ReviewPage() {
         
 
         <Card className="w-full">
-        <Link to="/" className="flex items-center px-5 text-sm  hover:text-gray-400 cursor-pointer" >
+        <Link to="/" className="flex w-fit items-center px-5 text-sm  hover:text-gray-400 cursor-pointer" >
             <ArrowLeft />
             <span>Voltar</span>
         </Link>

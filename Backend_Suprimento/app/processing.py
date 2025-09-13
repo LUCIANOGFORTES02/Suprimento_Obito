@@ -2,10 +2,14 @@ import re
 import typing
 import unicodedata
 from dataclasses import dataclass, field
+from PIL import Image
+
 
 import pdfplumber
 from pdf2image import convert_from_path
 from pytesseract import image_to_string
+import logging, traceback
+
 
 
 # =========================
@@ -66,73 +70,93 @@ def fix_local_obito_uf(local: typing.Optional[str]) -> typing.Optional[str]:
 # =====================================
 # PDF context (abre 1x e faz cache)
 # =====================================
-# @dataclass
-# class PDFContext:
-#     pdf_path: str
-#     _pdf: pdfplumber.PDF = field(init=False, default=None)
-#     pages_text: list[str] = field(init=False, default=None)
-#     _img_cache_300:dict[int, "PIL.Image.Image"] = field(init=False, default_factory=dict)
-#     _img_cache_400:dict[int, "PIL.Image.Image"] = field(init=False, default_factory=dict)
-#     _footer_text_cache: dict[int, str] = field(default_factory=dict, init=False)
+@dataclass
+class PDFContext:
+    pdf_path: str
+    _pdf: pdfplumber.PDF = field(init=False)
+    pages_text: list[str] = field(init=False)
+    _img_cache_300:dict[int, "Image.Image"] = field(init=False, default_factory=dict)
+    _img_cache_400:dict[int, "Image.Image"] = field(init=False, default_factory=dict)
+    _footer_text_cache: dict[int, str] = field(default_factory=dict, init=False)
 
+    def __post_init__(self):
+        self.pdf = pdfplumber.open(self.pdf_path)
+        self.pages_text = []
+        for page in self.pdf.pages:
+            txt = page.extract_text() or ""
+            self.pages_text.append(txt)
 
-
-
-
-
-
-
-
-def page_needs_ocr(txt: str) -> bool:
-    # se não extraiu NADA ou é muito curto, manda para OCR
-    return len(normalize_spaces(txt).split()) < 70
-
-def ocr_pages_images (pdf_path:str, page_indices:typing.List[int]) -> dict:
-  results = {}
-  if not page_indices:
-    return results
-  first = min(page_indices) + 1
-  last  = max(page_indices) + 1
-
-  #Converter as páginas necessárias para imagem
-  pages = convert_from_path(pdf_path, dpi=300, first_page=first, last_page=last)
-
-  start = min (page_indices)
-  for offset, img in enumerate(pages):
-    index= start + offset
-    if index in page_indices:
-      text = image_to_string(img, lang='por') or ""
-      results[index] = text
-  return results
-
-
-
-
-
-
-# -------------------------
-# Extração texto (pdfplumber + OCR seletivo)
-# -------------------------
-def extract_text_with_pdfplumber(pdf_path: str) -> tuple[str, list[str]]:
-    pages_text = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for i,page in enumerate(pdf.pages):
-            text = page.extract_text()
-            pages_text.append(text)
+        # OCR seletivo de páginas "curtas"
+        ocr_candidates = [i for i, t in enumerate(self.pages_text)
+                          if len(normalize_spaces(t).split()) < SHORT_TEXT_WORDS]
+        if ocr_candidates:
+            self._batch_raster_and_ocr(ocr_candidates, OCR_DPI_BODY)
     
-    # identifica páginas candidatas a OCR
-    ocr_candidates = [i for i, t in enumerate(pages_text) if page_needs_ocr(t)]
+    def close(self):
+        try:
+            self.pdf.close()
+        except Exception:
+            pass
+
+    # ---------- Raster/OCR ----------
+    def _batch_raster_and_ocr(self, page_indices: list[int], dpi: int):
+        if not page_indices:
+            return
+        first = min(page_indices) + 1
+        last  = max(page_indices) + 1
+        pages = convert_from_path(self.pdf_path, dpi=dpi, first_page=first, last_page=last)
+        start = min(page_indices)
+        for offset, img in enumerate(pages):
+            idx = start + offset
+            if idx in page_indices:
+                if dpi == 300:
+                    self._img_cache_300[idx] = img
+                else:
+                    self._img_cache_400[idx] = img
+                if len(normalize_spaces(self.pages_text[idx]).split()) < SHORT_TEXT_WORDS:
+                    self.pages_text[idx] = image_to_string(img, lang="por") or self.pages_text[idx]
     
+    def _get_page_image(self, i: int, dpi: int):
+        cache = self._img_cache_400 if dpi >= 400 else self._img_cache_300
+        if i not in cache:
+            pages = convert_from_path(self.pdf_path, dpi=dpi, first_page=i+1, last_page=i+1)
+            if pages:
+                cache[i] = pages[0]
+        return cache.get(i)
+       
+    def ocr_region(self, i: int, frac_top: float, frac_bottom: float, dpi: int, psm: int = 6) -> str:
+        img = self._get_page_image(i, dpi=dpi)
+        if img is None:
+            return ""
+        w, h = img.size
+        y0 = int(h * frac_top)
+        y1 = int(h * (1.0 - frac_bottom))
+        crop = img.crop((0, y0, w, y1))
+        return image_to_string(crop, lang="por", config=f"--oem 1 --psm {psm}") or ""
+    
+    def ocr_header(self, i: int, frac: float = HEADER_FRAC) -> str:
+        return self.ocr_region(i, 0.0, 1.0-frac, dpi=OCR_DPI_HEADER, psm=6)
 
-    ocr_texts = ocr_pages_images(pdf_path, ocr_candidates)
-    #Substitui texto vazio por OCR
-    for index, ocr_t in ocr_texts.items():
-        if len(normalize_spaces(pages_text[index]).split()) <70 and len (normalize_spaces(ocr_t)) > 0:
-            pages_text[index] = ocr_t
+    def ocr_footer(self, i: int, frac: float = FOOTER_FRAC) -> str:
+        return self.ocr_region(i, 1.0-frac, 0.0, dpi=OCR_DPI_FOOTER, psm=6)
 
-    full_text = "\n\n".join(pages_text)
-    # print("Texto",full_text)
-    return full_text, pages_text
+    def footer_text(self, i: int, frac: float = FOOTER_FRAC) -> str:
+        if i in self._footer_text_cache:
+            return self._footer_text_cache[i]
+        try:
+            page = self.pdf.pages[i]
+            w, h = page.width, page.height
+            bbox = (0, h*(1-frac), w, h)
+            clip = page.within_bbox(bbox)
+            txt = clip.extract_text(x_tolerance=0.5, y_tolerance=0.5) or ""
+            if not txt.strip():
+                words = clip.extract_words(x_tolerance=0.5, y_tolerance=0.5) or []
+                txt = " ".join(wd["text"] for wd in words)
+        except Exception:
+            txt = ""
+        self._footer_text_cache[i] = txt
+        return txt
+
 
 # ---------------------------------------------------------------------
 # Parsers / Regex
@@ -173,70 +197,21 @@ def to_br_date(text: str) -> typing.Optional[str]:
 
     return None
 
-# Número do processo (CNJ)
+# Número do processo (CNJ)--------------------
 CNJ_REGEX = re.compile(r"\b\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}\b")
 def extract_numero_processo(text: str) -> typing.Optional[str]:
     m = CNJ_REGEX.search(text)
     return m.group(0) if m else None
 
-# Tabela "Documentos" do PJe para encontar o ID do Parecer
-# Reconstrói: '71058' + '\n319' => '71058319'
-# ------------------------
-TIPOS_RE = (
-    r"(?:"
-    r"Pet[ií]ç[aã]o Inicial|Pet[ií]ç[aã]o|Certid[aã]o|Intima[cç][aã]o|"
-    r"Manifesta[cç][aã]o(?:\s+do\s+Minist[eé]rio\s+P[úu]blico)?|"
-    r"Parecer(?:\s+do\s+(?:MP|Minist[eé]rio\s+P[úu]blico))?|Parecer|"
-    r"Despacho|Sistema|DOCUMENTO COMPROBAT[ÓO]RIO"
-    r")"
-)
-ROW_RE = re.compile(
-    rf"^\s*(?P<id5>\d{{5}})\s+(?P<data>\d{{2}}/\d{{2}}/\d{{4}})\s+(?P<hora>\d{{2}}:\d{{2}})\s+(?P<doc>.*?)\s+(?P<tipo>{TIPOS_RE})\s*$",
-    flags=re.IGNORECASE
-)
-SUF_RE = re.compile(r"^\s*(?P<suf>\d{3})\s*$")
-
-
-def norm_tipo(t: str) -> str:
-    t = t.strip().lower()
-    # normaliza acentos que a extração às vezes perde
-    t = (t
-         .replace("peticao", "petição")
-         .replace("certidao", "certidão")
-         .replace("intimacao", "intimação")
-         .replace("manifestacao", "manifestação")
-         .replace("comprobatorio", "comprobatório")
-         .replace("ministerio publico", "ministério público"))
-    
-    # normalizações para parecer
-    if "parecer" in t:
-        return "parecer"
-    if "manifestação" in t and "ministério público" in t:
-        return "parecer"  # tratamos manifestação do MP como “parecer”
-    
-    mapa = {
-        "petição inicial": "petição inicial",
-        "petição": "petição",
-        "certidão": "certidão",
-        "intimação": "intimação",
-        "manifestação": "manifestação",
-        "despacho": "despacho",
-        "sistema": "sistema",
-        "documento comprobatório": "documento comprobatório",
-    }
-    return mapa.get(t, t)
-
-
-
-# Requerente
+# Requerente ------------------------
 def extract_requerente(text: str) -> typing.Optional[str]:
-    m = re.search(r"(?im)^\s*REQUERENTE\s*[:\-]\s*(.+)$", text)
+    m = re.search(r"(?im)^\s*REQUERENTE\s*[:\-]\s*(.+)$", text or "")
     if m:
         return normalize_spaces(m.group(1))
-    m = re.search(r"REQUERENTE\s*[:\-]\s*(.+)", text, flags=re.IGNORECASE)
+    m = re.search(r"REQUERENTE\s*[:\-]\s*(.+)", text or "", flags=re.IGNORECASE)
     return normalize_spaces(m.group(1)) if m else None
 
-# Parentesco + Nome do falecido 
+# Parentesco +  Falecido ------------- 
 RE_PARENTESCO = r"""
 (?:\b(?:é\s+)?(?:a|o)?\s*)?
 (?P<grau>
@@ -291,11 +266,9 @@ def extract_parentesco_e_falecido(text: str) -> tuple[typing.Optional[str], typi
             return grau, nome
     return None, None
 
-# Local do óbito + Data do óbito (em dd/mm/yyyy)
-#Espera texto assim: falecida em Teresina – PI, no dia 07 de outubro de 2022
+
 # =========================
-# Local do óbito + Data
-# =========================
+# Local do óbito + Data ------------------------
 DASH_CHARS = "-–—"
 DASH_CC    = f"[{re.escape(DASH_CHARS)}]"
 
@@ -309,44 +282,114 @@ RE_LOCAL_DATA_EXTENSO = re.compile(rf"""
 """, re.IGNORECASE | re.VERBOSE)
 
 
-#Local do Óbito
-def extract_local_obito(text: str) -> typing.Optional[str]:
-    m = RE_LOCAL_DATA_EXTENSO.search(text)
-    if m:
-        return f"{normalize_spaces(m.group('cidade'))}-{m.group('uf').upper()}"
-    m = re.search(r"local do falecimento[\s,:-]*([^\n\r]+)", text, flags=re.IGNORECASE)
-    if m:
-        return normalize_spaces(m.group(1))
-    cap = rf"([A-Z][A-Za-zÀ-ÿ]+)\s*[{DASH_CC}]\s*([A-Z]{{2}})"
-    a = re.search(cap, text)
-    return normalize_spaces(a.group(0)) if a else None
-
-#Data do Óbito
-DASH_CHARS = "-–—"
-DASH_CC    = f"[{re.escape(DASH_CHARS)}]"
+# aceita 17/03/2020, 17-03-2020 ou 17.03.2020
+RE_DATA_NUM_ANY = re.compile(r"\b(\d{1,2})[./-](\d{1,2})[./-](\d{4})\b")
 RE_DATA_EXTENSO = re.compile(
     r"\b(\d{1,2})\s+de\s+(janeiro|fevereiro|mar[cç]o|abril|maio|junho|"
     r"julho|agosto|setembro|outubro|novembro|dezembro)\s+de\s+(\d{4})\b",
     re.IGNORECASE
 )
-RE_DATA_NUM = re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b")
-# RE_GATILHO = re.compile(
-#     rf"(falecid[oa]|falecimento|faleceu|ó?bito|"
-#     rf"[A-ZÀ-Ý][A-Za-zÀ-ÿ\s.'-]+{DASH_CC}\s*[A-Z]{{2}}\s*,?\s*(?:dia\s+)?)",
-#     re.IGNORECASE
-# )
+#âncoras
+RE_FALECEU = re.compile(r"(falecid[oa]|faleceu|óbito)", re.IGNORECASE)
 RE_CAUSA_MORTIS = re.compile(r"causa\s+mortis", re.IGNORECASE)
+
+
+#Local do Óbito ---------------------------
+# Padrão geral para Cidade–UF (tolerante a nomes compostos, hífen/apóstrofo)
+# -------- Local do óbito --------
+DASH_CHARS = "-–—"
+DASH_CC    = f"[{re.escape(DASH_CHARS)}]"
+RE_CAUSA_MORTIS = re.compile(r"causa\s+mortis", re.IGNORECASE)
+
+CITY_TOKEN = r"[A-ZÁÉÍÓÚÂÊÔÃÕÇ][a-záéíóúâêôãõç'’.-]+"
+CITY_NAME  = rf"{CITY_TOKEN}(?:\s+(?:d[aeo]s?|de|do|da|dos|das|e)\s+{CITY_TOKEN}){{0,4}}"
+
+# 1) cidade–UF logo após 'falecid(a)/faleceu/óbito ... em'
+EM_CITY_RE = re.compile(
+    rf"(?:falecid[oa]|faleceu|ó?bito)[^.\n]{{0,120}}?\bem\s+(?P<cidade>{CITY_NAME})\s*{DASH_CC}\s*(?P<uf>[A-Z]{{2}})",
+    re.IGNORECASE
+)
+
+# 2) cidade–UF genérico (usado como fallback)
+CITY_UF_RE = re.compile(
+    rf"(?P<cidade>{CITY_NAME})\s*{DASH_CC}\s*(?P<uf>[A-Z]{{2}})",
+    re.IGNORECASE
+)
+
+_STOP_CITY = {
+    "juizo","juízo","justica","justiça","defensoria","promotoria",
+    "vara","comarca","direito","exercicio","exercício","itinerante","tribunal","poder"
+}
+
+def _ok_city(cidade: str) -> bool:
+    toks = cidade.split()
+    if len(toks) > 6:                 # cidades reais raramente passam disso
+        return False
+    if any(lower_noacc(t) in _STOP_CITY for t in toks):
+        return False
+    return True
+
+def extract_local_obito(text: str) -> typing.Optional[str]:
+    if not text:
+        return None
+    t = re.sub(r"\s+", " ", text)
+
+    # limitar a busca ao trecho ANTES de "causa mortis"
+    m_anchor = RE_CAUSA_MORTIS.search(t)
+    search_space = t[:m_anchor.start()] if m_anchor else t
+
+    # (1) ancorado em '... em Cidade – UF'
+    m = EM_CITY_RE.search(search_space)
+    if m and _ok_city(m.group("cidade")):
+        return f"{normalize_spaces(m.group('cidade'))}-{m.group('uf').upper()}"
+
+    # (2) último Cidade – UF válido antes da âncora
+    last = None
+    for mm in CITY_UF_RE.finditer(search_space):
+        cidade = normalize_spaces(mm.group("cidade"))
+        if _ok_city(cidade):
+            last = (cidade, mm.group("uf").upper())
+    if last:
+        return f"{last[0]}-{last[1]}"
+
+    # (3) fallbacks leves (também no trecho antes da âncora)
+    m = re.search(r"local do falecimento[\s,:-]*([^\n\r]+)", search_space, flags=re.IGNORECASE)
+    if m:
+        return normalize_spaces(m.group(1))
+
+    cap = rf"([A-ZÁÉÍÓÚÂÊÔÃÕÇ][a-záéíóúâêôãõç'.-]+)\s*{DASH_CC}\s*([A-Z]{{2}})"
+    a = re.search(cap, search_space)
+    return normalize_spaces(a.group(0)) if a else None
+
+#Data do Óbito ------------------------------
 def extract_data_obito(text: str) -> typing.Optional[str]:
     if not text:
         return None
-    m = RE_LOCAL_DATA_EXTENSO.search(text)
     t = re.sub(r"\s+", " ", text)
-
+    # 1) “falecida/faleceu em Cidade – UF, dia <data por extenso>”
+    m = RE_LOCAL_DATA_EXTENSO.search(t)
     if m:
         return to_br_date_from_extenso(m.group('dia'), m.group('mes'), m.group('ano'))
-    m = re.search(r"(?:falecimento|faleceu|óbito).{0,40}?\b(\d{1,2}/\d{1,2}/\d{4})\b", text, flags=re.IGNORECASE | re.DOTALL)
     
-    # b2) FALLBACK: pegar a última data ANTES de "causa mortis"
+    m = re.search(r"(?:falecimento|faleceu|óbito).{0,40}?\b(\d{1,2}/\d{1,2}/\d{4})\b", text, flags=re.IGNORECASE | re.DOTALL)
+    # 2) Preferir a data logo após a ÚLTIMA ocorrência de “falecido/faleceu/óbito”
+    #    (evita confundir com “nascido em …” antes)
+    last_fal = None
+    for mf in RE_FALECEU.finditer(t):
+        last_fal = mf
+    if last_fal:
+        janela = t[last_fal.end() : last_fal.end() + 160]   # 160 chars após “falecido/faleceu”
+        m_ext = RE_DATA_EXTENSO.search(janela)
+        if m_ext:
+            d, mes, a = m_ext.groups()
+            return to_br_date_from_extenso(d, mes, a)
+        m_num = RE_DATA_NUM_ANY.search(janela)
+        if m_num:
+            d, mth, y = map(int, m_num.groups())
+            return f"{d:02d}/{mth:02d}/{y:04d}"
+
+
+    # 3) Fallback: pegar a ÚLTIMA data antes de “causa mortis”
     m_anchor = RE_CAUSA_MORTIS.search(t)
     if m_anchor:
         prefix = t[:m_anchor.start()]
@@ -358,15 +401,58 @@ def extract_data_obito(text: str) -> typing.Optional[str]:
             return to_br_date_from_extenso(dia, mes, ano)
 
         last_num = None
-        for nm in RE_DATA_NUM.finditer(prefix):
+        for nm in RE_DATA_NUM_ANY.finditer(prefix):
             last_num = nm
         if last_num:
             d, mn, y = map(int, last_num.groups())
             return f"{d:02d}/{mn:02d}/{y:04d}"
     return to_br_date(m.group(1)) if m else None
 
-# IDs do Parecer (da TABELA)
+# --- Parecer (tabela do PJe) ---
+# ------------------------
+TIPOS_RE = (
+    r"(?:"
+    r"Pet[ií]ç[aã]o Inicial|Pet[ií]ç[aã]o|Certid[aã]o|Intima[cç][aã]o|"
+    r"Manifesta[cç][aã]o(?:\s+do\s+Minist[eé]rio\s+P[úu]blico)?|"
+    r"Parecer(?:\s+do\s+(?:MP|Minist[eé]rio\s+P[úu]blico))?|Parecer|"
+    r"Despacho|Sistema|DOCUMENTO COMPROBAT[ÓO]RIO"
+    r")"
+)
+ROW_RE = re.compile(
+    rf"^\s*(?P<id5>\d{{5}})\s+(?P<data>\d{{2}}/\d{{2}}/\d{{4}})\s+(?P<hora>\d{{2}}:\d{{2}})\s+(?P<doc>.*?)\s+(?P<tipo>{TIPOS_RE})\s*$",
+    flags=re.IGNORECASE
+)
+SUF_RE = re.compile(r"^\s*(?P<suf>\d{3})\s*$")
 
+
+def norm_tipo(t: str) -> str:
+    t = t.strip().lower()
+    # normaliza acentos que a extração às vezes perde
+    t = (t
+         .replace("peticao", "petição")
+         .replace("certidao", "certidão")
+         .replace("intimacao", "intimação")
+         .replace("manifestacao", "manifestação")
+         .replace("comprobatorio", "comprobatório")
+         .replace("ministerio publico", "ministério público"))
+    
+    # normalizações para parecer
+    if "parecer" in t:
+        return "parecer"
+    if "manifestação" in t and "ministério público" in t:
+        return "parecer"  # tratamos manifestação do MP como “parecer”
+    
+    mapa = {
+        "petição inicial": "petição inicial",
+        "petição": "petição",
+        "certidão": "certidão",
+        "intimação": "intimação",
+        "manifestação": "manifestação",
+        "despacho": "despacho",
+        "sistema": "sistema",
+        "documento comprobatório": "documento comprobatório",
+    }
+    return mapa.get(t, t)
 
 def parse_tabela_documentos(text: str) -> list[dict]:
     rows = []
@@ -395,25 +481,16 @@ def parse_tabela_documentos(text: str) -> list[dict]:
     return rows
 
 def extract_id_parecer(text: str) -> typing.Optional[str]:
-    rows = parse_tabela_documentos(text)
+    rows = parse_tabela_documentos(text or "")
     # candidatos: qualquer linha normalizada para "parecer"
     candidatos = [r for r in rows if r["tipo"] in ("parecer","manifestação")]
     if candidatos:
         return candidatos[-1]["id"]
-
-    # fallback: varrer o texto cru procurando um "Parecer ..." seguido de "Num. 12345 678"
-    # m = re.search(
-    #     r"(?:parecer|manifesta[cç][aã]o\s+do\s+minist[eé]rio\s+p[úu]blico)[\s\S]{0,120}?"
-    #     r"(?:num[ºo.]?\s*)?(\d{5})\s*[\r\n ]+(\d{3})",
-    #     text,
-    #     flags=re.IGNORECASE,
-    # )
-    # if m:
-    #     return m.group(1) + m.group(2)
-
     return None
+
 #---------------------------------------------------------------------------------------------------------------------------
-# id declaração de óbito 
+# --- Declaração de Óbito: ID (Num. ... - Pág. ...) ---
+
 
 # Traços aceitos: hífen, en-dash, em-dash
 DASH_CHARS = "-–—"
@@ -434,6 +511,7 @@ ID_PAG_FUZZY = re.compile(
     r"N\w{1,2}\W*\s*(\d{6,})\W+\s*P\w{1,2}g\W*\s*(\d+)",
     re.IGNORECASE
 )
+
 PALAVRAS_DECL = [
     "Declaração de Óbito","Declaracao de Obito",
     "Ministerio da Saude", "Ministério da Saúde",
@@ -442,14 +520,13 @@ PALAVRAS_DECL = [
     "Cartório do Registro Civil","Cartorio do Registro Civil"
 ]
 
-def palavras_encontradas(texto: str) -> list[str]:
-    s = (texto or "").lower()
-    return [p for p in PALAVRAS_DECL if p.lower() in s]
+def _count_kw(*texts: str) -> int:
+    """Conta quantas palavras da lista aparecem (presença distinta, não repetição)."""
+    s = " ".join((t or "").lower() for t in texts)
+    return sum(1 for p in PALAVRAS_DECL if p.lower() in s)
 
-def tem_palavras_chave(texto: str) -> int:
-    return len(palavras_encontradas(texto))
 
-def extrai_id_pag(texto: str) -> typing.Optional[str]:
+def _extrai_id_pag(texto: str) -> typing.Optional[str]:
     m = ID_PAG_PAT.search(texto or "")
     if m:
         return f"Num. {m.group('num')} - Pág. {m.group('pag')}"
@@ -457,98 +534,75 @@ def extrai_id_pag(texto: str) -> typing.Optional[str]:
     if m:
         return f"Num. {m.group(1)} - Pág. {m.group(2)}"
     return None
+RE_DO_HEADER   = re.compile(r"\bdeclara[cç][aã]o\s+de\s+[óo]bito\b", re.IGNORECASE)
+RE_NASC_HEADER = re.compile(r"\bcertid[aã]o\s+de\s+nascimento\b", re.IGNORECASE)
+RE_RCNP        = re.compile(r"registro\s+civil\s+das\s+pessoas\s+naturais", re.IGNORECASE)
 
-def extract_id_declaracao_avancado(pages_text: list[str], pdf_path: str) -> typing.Optional[str]:
-    # 1) primeiro, tente achar páginas candidatas por palavras-chave
-    # Candidatas: >=2 palavras no texto DA PÁGINA OU no header OCR
+def _has_do_header(ctx: PDFContext, i: int, frac: float = 0.42) -> bool:
+    """True se o topo da página (OCR) ou o texto extraído contiver 'Declaração de Óbito'."""
+    head_ocr = ctx.ocr_header(i, frac=frac) or ""
+    if RE_DO_HEADER.search(head_ocr):
+        return True
+    # fallback: às vezes o pdf tem texto vetorial e o pdfplumber já pegou
+    return RE_DO_HEADER.search(ctx.pages_text[i] or "") is not None
+
+def _is_certidao_nascimento(ctx: PDFContext, i: int, frac: float = 0.42) -> bool:
+    """True se o topo indicar 'Certidão de Nascimento' (evita falsos positivos)."""
+    head_ocr = ctx.ocr_header(i, frac=frac) or ""
+    sniff = (head_ocr + " " + (ctx.pages_text[i] or "")[:500]).lower()
+    return bool(RE_NASC_HEADER.search(sniff) or RE_RCNP.search(sniff))
+
+def extract_id_declaracao_avancado(ctx: PDFContext) -> typing.Optional[str]:
     candidatas = []
-    for i, pagina in enumerate(pages_text):
-        hits = tem_palavras_chave(pagina)
-        try:
-            head_ocr = ocr_header(pdf_path, i, frac=0.32)
-        except Exception:
-            head_ocr = ""
-        hits_hdr = tem_palavras_chave(head_ocr)
-        if (hits + hits_hdr) >= 2:
+
+    # 1) Só entram páginas que tenham 'Declaração de Óbito' no topo (e não sejam CN)
+    for i, _ in enumerate(ctx.pages_text):
+        body = ctx.pages_text[i] or ""
+        head = ctx.ocr_header(i, frac=0.42) or ""
+
+        # filtros obrigatórios
+        has_do = RE_DO_HEADER.search(head) or RE_DO_HEADER.search(body)
+        is_cn  = RE_NASC_HEADER.search((head + " " + body).lower()) or RE_RCNP.search((head + " " + body).lower())
+
+        # novo: precisa ter > 2 palavras-chave (>= 3)
+        kw_score = _count_kw(body, head)
+
+        # debug opcional
+        print(f"[DO] pág {i+1:>2}  has_DO={bool(has_do)}  is_CN={bool(is_cn)}  kw={kw_score}")
+
+        if has_do and not is_cn and kw_score >= 2:
             candidatas.append(i)
-    
-    # Fallback: nenhuma candidata → testa todas
+
+    # Sem candidatas válidas → nada a retornar
     if not candidatas:
-        # fallback: tente todas, se por algum motivo a extração do corpo não trouxe as palavras
-        candidatas = list(range(len(pages_text)))
+        return None
 
+    # 2) Tenta extrair o "Num. ... - Pág. ..." nas candidatas
     for i in candidatas:
-        # (a) tenta no texto "cru" da página
-        idp = extrai_id_pag(pages_text[i])
+        # (a) corpo da página (às vezes o OCR joga o rodapé no corpo)
+        idp = _extrai_id_pag(ctx.pages_text[i])
         if idp:
+            print(f"[DO] pág {i+1}: ID pelo corpo")
             return idp
 
-        # (b) rodapé (pdfplumber → OCR)
-        txt_pdf = pdf_footer_text(pdf_path, i)
-        idp = extrai_id_pag(txt_pdf)
+        # (b) rodapé via pdfplumber
+        idp = _extrai_id_pag(ctx.footer_text(i))
         if idp:
+            print(f"[DO] pág {i+1}: ID no rodapé (pdf)")
             return idp
 
-        rodape = ocr_footer(pdf_path, i, frac=0.28)
-        idp = extrai_id_pag(rodape)
+        # (c) rodapé via OCR
+        idp = _extrai_id_pag(ctx.ocr_footer(i, frac=0.28))
         if idp:
+            print(f"[DO] pág {i+1}: ID no rodapé (ocr)")
             return idp
 
     return None
 
 
 #------------------------------------------------------------------------------------------------------
-# id certidões negativas
-# --- OCR genérico de uma região da página (coordenadas fracionadas) ---
-def ocr_region(pdf_path: str, page_index: int, box_frac=(0.0, 0.0, 1.0, 1.0), dpi: int = 400, psm: int = 6) -> str:
-    """
-    box_frac = (x0, y0, x1, y1) em fração da largura/altura [0..1].
-    Ex.: (0, 0, 1, 0.4) = faixa superior; (0, 0.78, 1, 1) = rodapé.
-    """
+# --- Certidões negativas ---
 
-    imgs = convert_from_path(pdf_path, dpi=dpi, first_page=page_index + 1, last_page=page_index + 1)
-    if not imgs:
-        return ""
-    img = imgs[0]
-    w, h = img.size
-    x0, y0, x1, y1 = box_frac
-    box = (int(w*x0), int(h*y0), int(w*x1), int(h*y1))
-    crop = img.crop(box)
-    cfg = f"--oem 1 --psm {psm}"
-    return image_to_string(crop, lang="por", config=cfg) or ""
-
-def ocr_header(pdf_path: str, page_index: int, frac: float = 0.42) -> str:
-    # OCR do topo (~42% superior)
-    return ocr_region(pdf_path, page_index, (0.0, 0.0, 1.0, frac), dpi=400, psm=6)
-
-def ocr_footer(pdf_path: str, page_index: int, frac: float = 0.22) -> str:
-    # OCR do rodapé (~22% inferior)
-    return ocr_region(pdf_path, page_index, (0.0, 1.0 - frac, 1.0, 1.0), dpi=400, psm=6)
-
-def pdf_footer_text(pdf_path: str, page_index: int, frac: float = 0.22) -> str:
-    """Extrai texto do rodapé usando pdfplumber (quando for texto vetorial)."""
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            page = pdf.pages[page_index]
-            w, h = page.width, page.height
-            bbox = (0, h*(1-frac), w, h)
-            clip = page.within_bbox(bbox)
-            txt = clip.extract_text(x_tolerance=0.5, y_tolerance=0.5) or ""
-            if txt.strip():
-                return txt
-            words = clip.extract_words(x_tolerance=0.5, y_tolerance=0.5) or []
-            return " ".join(wd["text"] for wd in words)
-    except Exception:
-        return ""
-
-
-
-
-def _ctx(s: str, start: int, end: int, span: int = 40) -> str:
-    """Extrai um contexto curto ao redor de um match, para log."""
-    a = max(0, start - span)
-    b = min(len(s), end + span)
-    return s[a:b].replace("\n", " ")
 
 
 # Positivos
@@ -568,245 +622,90 @@ RE_CARTORIO_STRONG = re.compile(
     re.IGNORECASE
 )
 
-
 # Negativos/exclusões (evitar nascimento e certidões judiciais)
 RE_EXCL_NASC = re.compile(r"certidao\s+de\s+nascimento", re.IGNORECASE)
-RE_EXCL_JUD = re.compile(r"(poder\s+judiciario|processo\s*n?[ºo]|classe\s*:|assunto\s*:|requerente\s*:|justica\s+itinerante)", re.IGNORECASE)
+RE_EXCL_JUD = re.compile(r"(processo\s*n?[ºo]|classe\s*:|assunto\s*:|requerente\s*:|justi[cç]a\s+itinerante)",re.IGNORECASE
+)
+RE_EXCL_MP = re.compile(r"(minist[eé]rio\s+p[úu]blico|promotori[ao]?\s+de\s+justi[cç]a|"r"promotor[ao]\s+de\s+justi[cç]a|\bparquet\b)",re.IGNORECASE,)
 
 
-
-def explain_page(text: str) -> dict:
+def _explain_page(text: str) -> dict:
     """
     Avalia todos os sinais na página/trecho e explica o que bateu.
     Retorna um dicionário com flags e trechos (snippets) de cada match.
     """
     t = lower_noacc(text or "")
-    out = {
-        "exclusions": {},
-        "positives": {},
-        "neg_obito_window": negacao_perto_de_obito(t),
-        "is_cert": False,
-        "requirements": {},
-    }
-
-     # exclusões
-    m = RE_EXCL_NASC.search(t); out["exclusions"]["nascimento"] = _ctx(t, *m.span()) if m else ""
-    m = RE_EXCL_JUD.search(t);  out["exclusions"]["judiciario"] = _ctx(t, *m.span()) if m else ""
-
-    # Positivos
-    for name, rx in [
-        ("titulo_certidao_negativa", RE_CERT_NEG_TIT),
-        ("tabela_crcn", RE_TABELA_CRCN),
-        ("marcas_crcn", RE_MARCAS_CRCN),
-        ("hash", RE_HASH),
-        ("cartorio", RE_CARTORIO),
-        ("cartorio_strong", RE_CARTORIO_STRONG),
-
-        ("obito", RE_OBITO),
-
-    ]:
-        m = rx.search(t)
-        out["positives"][name] = _ctx(t, *m.span()) if m else ""
-
-    # >>> DECISÃO: título é OBRIGATÓRIO
-    excl          = any(out["exclusions"].values())
-    has_title     = bool(RE_CERT_NEG_TIT.search(t))
-    has_cartorio  = bool(RE_CARTORIO.search(t) or RE_CARTORIO_STRONG.search(t))
-    out["requirements"]["has_title"]    = has_title
-    out["requirements"]["has_cartorio"] = has_cartorio
-
-    # Decisão: só aprova com título + cartório e sem exclusões
-    out["is_cert"] = (not excl) and has_title and has_cartorio
-    return out
+    excl = any(rx.search(t) for rx in (RE_EXCL_NASC, RE_EXCL_JUD,RE_EXCL_MP))
+    has_title = bool(RE_CERT_NEG_TIT.search(t))
+    has_cart  = bool(RE_CARTORIO.search(t) or RE_CARTORIO_STRONG.search(t))
+    is_cert   = (not excl) and has_title and has_cart
+    return {"is_cert": is_cert}
 
 
-def negacao_perto_de_obito(t: str, window: int = 120) -> bool:
-    # ...negativa... perto de "óbito" (em qualquer ordem)
-    t = lower_noacc(t)
-    return (re.search(rf"(?:{RE_NEG}).{{0,{window}}}obit", t) is not None
-            or re.search(rf"obit.{{0,{window}}}(?:{RE_NEG})", t) is not None)
 
-def is_certidao_negativa(texto: str) -> bool:
-    """
-    True se a página é a CERTIDÃO NEGATIVA (não apenas menciona uma).
-    REQUISITO: deve haver o título 'CERTIDÃO ... NEGATIVA' no texto analisado.
-    """
-    t = lower_noacc(texto)
-
-    # Exclusões claras
-    if RE_EXCL_NASC.search(t):  # "certidão de nascimento"
-        return False
-    if RE_EXCL_JUD.search(t):   # cabeçalho de peça judicial
-        return False
-    # if RE_EXCL_MP.search(t):    # Ministério Público
-    #     return False
-
-    # 🚫 sem TÍTULO -> já descarta
-    if not RE_CERT_NEG_TIT.search(t):
-        return False
-
-    # ✅ Com título, aceitamos. Sinais extras reforçam (não são obrigatórios).
-    #    Se quiser endurecer, descomente a linha com 'and RE_OBITO.search(t)'.
-    if (RE_TABELA_CRCN.search(t) or RE_MARCAS_CRCN.search(t) or RE_HASH.search(t)):
-        return True
-
-    # fallback: título sozinho (útil quando OCR perde outros trechos)
-    return True
-
-
-def parse_id_pag(s: str) -> typing.Optional[tuple[str, str]]:
-    if not s:
-        return None
-    m = ID_PAG_PAT.search(s)
-    if m:
-        return m.group("num"), m.group("pag")
-    m = ID_PAG_FUZZY.search(s)
-    if m:
-        return m.group(1), m.group(2)
-    return None
-
-
-def find_certidoes_negativas(pdf_path: str, pages_text: list[str], debug: bool = False):
-    """
-    Retorna:
-      - se debug=False (padrão): list[dict] com as ocorrências
-      - se debug=True: (resultados, debug_pages)
-    """
+def find_certidoes_negativas(ctx: PDFContext, debug: bool = False):
     resultados = []
-    debug_pages = []
-
-    total = len(pages_text)
-    with pdfplumber.open(pdf_path) as pdf:
-        for i in range(total):
-            # --- fontes de texto que vamos avaliar e logar ---
-            fontes = []
-
-            full_txt = pages_text[i] or ""
-            fontes.append(("full", full_txt, explain_page(full_txt)))
-
-            # topo via pdfplumber
-            try:
-                page = pdf.pages[i]
-                w, h = page.width, page.height
-                header_clip = page.within_bbox((0, 0, w, h*0.55))
-                txt_head = header_clip.extract_text(x_tolerance=0.5, y_tolerance=0.5) or ""
-            except Exception:
-                txt_head = ""
-            if txt_head:
-                fontes.append(("pdf_header", txt_head, explain_page(txt_head)))
-
-            # OCR do topo se ainda não “decidiu”
-            decided = any(info["is_cert"] for _, _, info in fontes)
-            if not decided:
-                ocr_head = ocr_header(pdf_path, i, frac=0.55)
-                if ocr_head:
-                    fontes.append(("ocr_header", ocr_head, explain_page(ocr_head)))
-                    decided = any(info["is_cert"] for _, _, info in fontes)
-
-            # Escolha final: tem alguma fonte marcando como certidão?
-            eh_cert = decided
-            chosen_src = next((src for src, _, info in fontes if info["is_cert"]), None)
-
-            # Debug de decisão da página
-            if debug:
-                debug_pages.append({
-                    "page": i + 1,
-                    "sources": [
-                        {
-                            "src": src,
-                            "is_cert": info["is_cert"],
-                            "exclusions": info["exclusions"],
-                            "positives": info["positives"],
-                            "neg_obito_window": info["neg_obito_window"],
-                        }
-                        for (src, _txt, info) in fontes
-                    ],
-                    "chosen_src": chosen_src,
-                })
-
-            if not eh_cert:
-                continue
-
-            # --- rodapé: pdfplumber → OCR → vizinhos ---
-            id_source = None
-            rodape_txt = pdf_footer_text(pdf_path, i)
-            par = parse_id_pag(rodape_txt)
-            if par:
-                id_source = "pdf_footer"
+    for i, full_txt in enumerate(ctx.pages_text):
+        decided = _explain_page(full_txt)["is_cert"]
+        if not decided:
+            head_txt = ctx.ocr_header(i, frac=0.55)
+            if head_txt:
+                decided = _explain_page(head_txt)["is_cert"]
+        if not decided:
+            continue
+        par = None
+        txt_pdf = ctx.footer_text(i)
+        m = ID_PAG_PAT.search(txt_pdf or "")
+        if m: par = (m.group("num"), m.group("pag")); id_source = "pdf_footer"
+        if not par:
+            m2 = ID_PAG_FUZZY.search(txt_pdf or "")
+            if m2: par = (m2.group(1), m2.group(2)); id_source = "pdf_footer"
+        if not par:
+            rod_ocr = ctx.ocr_footer(i, frac=0.28)
+            m3 = ID_PAG_PAT.search(rod_ocr or "")
+            if m3: par = (m3.group("num"), m3.group("pag")); id_source = "ocr_footer"
             else:
-                rodape_ocr = ocr_footer(pdf_path, i, frac=0.28)
-                par = parse_id_pag(rodape_ocr)
-                if par:
-                    id_source = "ocr_footer"
-
-            if not par:
-                for j in (i-1, i+1):
-                    if 0 <= j < total:
-                        par = parse_id_pag(pdf_footer_text(pdf_path, j))
-                        if par:
-                            id_source = f"neighbor_pdf_footer(p{j+1})"
-                            break
-                        par = parse_id_pag(ocr_footer(pdf_path, j, frac=0.28))
-                        if par:
-                            id_source = f"neighbor_ocr_footer(p{j+1})"
-                            break
-
-            if par:
-                num, pag = par
-                resultados.append({
-                    "pdf_page": i + 1,
-                    "num": num,
-                    "pag": int(pag),
-                    "rodape": f"Num. {num} - Pág. {pag}",
-                    "id_source": id_source,
-                    "chosen_src": chosen_src,   # de onde veio a “certeza” da página
-                })
-            elif debug:
-                # registramos que a página foi classificada como certidão, mas não achou ID
-                debug_pages[-1]["id_error"] = "Rodapé não identificado (pdf/ocr/vizinhos)."
-
-    # ordenação opcional
-    # resultados.sort(key=lambda r: (r["num"], r["pag"]))
-
-    if debug:
-        return resultados, debug_pages
+                m4 = ID_PAG_FUZZY.search(rod_ocr or "")
+                if m4: par = (m4.group(1), m4.group(2)); id_source = "ocr_footer"
+        if par:
+            num, pag = par
+            resultados.append({
+                "pdf_page": i+1, "num": num, "pag": int(pag),
+                "rodape": f"Num. {num} - Pág. {pag}", "id_source": id_source, "chosen_src": "full"
+            })
     return resultados
 
 
 
 
 
-
-
+# =========================
+# Pipeline
+# =========================
 CAMPOS_ORDEM = [
     "numero_processo","requerente","parentesco","nome_falecido",
     "local_obito","data","id_parecer","id_declaracao","id_certidoes"
 ]
 
-def montar_resultado(full_text: str, pages_text: list[str],pdf_path:str) -> dict:
-    par, fal = extract_parentesco_e_falecido(full_text)
-    #encontrar todas as certidões negativas
-    # valores brutos
-    req_raw = extract_requerente(full_text)
-    fal_raw = fal
-    loc_raw = extract_local_obito(full_text)
+def montar_resultado(ctx: PDFContext) -> dict:
+    full_text = "\n\n".join(ctx.pages_text)
 
-    # pós-processamentos pedidos
-    requerente_fmt   = titlecase_nome(req_raw)
-    nome_falecido_fmt = titlecase_nome(fal_raw)
-    local_fmt        = fix_local_obito_uf(loc_raw)
+    par, fal = extract_parentesco_e_falecido(full_text)
+
+    req_raw = extract_requerente(full_text)
+    loc_raw = extract_local_obito(full_text)
    
 
     resultado = {
         "numero_processo": extract_numero_processo(full_text),
-        "requerente":      requerente_fmt,
+        "requerente":      titlecase_nome(req_raw),
         "parentesco":      par,
-        "nome_falecido":   nome_falecido_fmt,
-        "local_obito":     local_fmt,
+        "nome_falecido":   titlecase_nome(fal),
+        "local_obito":     fix_local_obito_uf(loc_raw),
         "data":            extract_data_obito(full_text),
         "id_parecer":      extract_id_parecer(full_text),
-        "id_declaracao":   extract_id_declaracao_avancado(pages_text,pdf_path),
-        "id_certidoes":    find_certidoes_negativas(pdf_path, pages_text),
+        "id_declaracao":   extract_id_declaracao_avancado(ctx),
+        "id_certidoes":    find_certidoes_negativas(ctx, debug=False),
     }
     print("Resultado extraído:", resultado)
     return resultado
@@ -818,27 +717,11 @@ def montar_resultado(full_text: str, pages_text: list[str],pdf_path:str) -> dict
 # Função para ler o arquivo PDF e retornar os dados extraídos
 # -------------------------
 def process_pdf(pdf_path: str) -> dict:
-    full_text, pages_text = extract_text_with_pdfplumber(pdf_path)
-    # for i, t in enumerate(pages_text, 1):
-    #         raw = t or ""
-    #         words = len(normalize_spaces(raw).split())
-    #         print("\n" + "="*80)
-    #         print(f"[PAGE {i}] chars={len(raw)}  words={words}")
-    #         print("-"*80)
-    #         print(raw if raw.strip() else "<<vazio>>")   
-    resultado = montar_resultado(full_text, pages_text,pdf_path)
-    # com debug (retorna também explicações)
-    certs, dbg = find_certidoes_negativas(pdf_path, pages_text, debug=True)
-    for d in dbg:
-        print(f"[CN-DEBUG] pág={d['page']}, chosen_src={d['chosen_src']}")
-        for s in d["sources"]:
-            if s["is_cert"]:
-                print("  - fonte:", s["src"])
-                print("    exclusões:", {k: bool(v) for k,v in s["exclusions"].items()})
-                print("    positivos:", {k: bool(v) for k,v in s["positives"].items()})
-                print("    neg_obito_window:", s["neg_obito_window"])
-    
-
-    return {
-        "resultado": resultado,
-    }
+    ctx = PDFContext(pdf_path)
+    try:
+        return {"resultado": montar_resultado(ctx)}
+    except Exception:
+        logging.exception("Erro processando %s", pdf_path)  # imprime stack trace
+        raise
+    finally:
+        ctx.close()
