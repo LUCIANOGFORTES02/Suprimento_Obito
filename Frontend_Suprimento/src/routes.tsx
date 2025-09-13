@@ -1,4 +1,4 @@
-import { Routes, Route } from "react-router";
+import { Routes, Route } from "react-router-dom";
 import UploadPage from "./pages/upload";
 import ReviewPage from "./pages/review";
 
