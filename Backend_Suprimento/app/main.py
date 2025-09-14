@@ -41,7 +41,13 @@ class ReviewData(BaseModel):
 
 
 
+@app.get("/")
+def root():
+    return {"status": "ok"}
 
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
