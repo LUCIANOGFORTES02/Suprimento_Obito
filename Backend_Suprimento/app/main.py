@@ -18,13 +18,19 @@ origins = [
     "http://localhost:8000",
     "https://suprimento-obito.vercel.app",
 ]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    # allow_credentials=True,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:8000",
+        "https://suprimento-obito.vercel.app",
+    ],
+    # cobre URLs de preview: https://<preview>.vercel.app
+    allow_origin_regex=r"https://([a-z0-9-]+\.)*vercel\.app$",
     allow_methods=["*"],
     allow_headers=["*"],
+    # keep it False se não usa cookies/autorização de 1º/3º
+    allow_credentials=False,
 )
 
 
@@ -45,9 +51,6 @@ class ReviewData(BaseModel):
 def root():
     return {"status": "ok"}
 
-@app.get("/healthz")
-def healthz():
-    return {"ok": True}
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
@@ -55,9 +58,13 @@ async def upload(file: UploadFile = File(...)):
     Processa o PDF e retorna APENAS os dados para preencher o formulário frontend
     """
     try:
+        print(f"[UPLOAD] nome={file.filename} tipo={file.content_type}")
+
         # Salva o arquivo temporariamente
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
             content = await file.read()
+            print(f"[UPLOAD] tamanho={len(content)} bytes")
+
             tmp_file.write(content)
             tmp_path = tmp_file.name
         
