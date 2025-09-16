@@ -15,9 +15,9 @@ import logging, traceback
 # =========================
 # Config
 # =========================
-OCR_DPI_BODY    = 300
-OCR_DPI_HEADER  = 300
-OCR_DPI_FOOTER  = 400
+OCR_DPI_BODY    = 220
+OCR_DPI_HEADER  = 220
+OCR_DPI_FOOTER  = 220
 HEADER_FRAC     = 0.42   # fração de altura para topo
 FOOTER_FRAC     = 0.22   # fração de altura para rodapé
 SHORT_TEXT_WORDS = 70    # limiar para decidir OCR de página

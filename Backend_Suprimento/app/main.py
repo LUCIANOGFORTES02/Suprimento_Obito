@@ -51,6 +51,7 @@ class ReviewData(BaseModel):
 def root():
     return {"status": "ok"}
 
+MAX_BYTES = 10 * 1024 * 1024  # 10 MB
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
@@ -58,15 +59,23 @@ async def upload(file: UploadFile = File(...)):
     Processa o PDF e retorna APENAS os dados para preencher o formulário frontend
     """
     try:
-        print(f"[UPLOAD] nome={file.filename} tipo={file.content_type}")
-
         # Salva o arquivo temporariamente
+        written = 0 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-            content = await file.read()
-            print(f"[UPLOAD] tamanho={len(content)} bytes")
-
-            tmp_file.write(content)
+            # content = await file.read()
+            await file.seek(0)
+            while True:
+                chunk = await file.read(1024 * 1024)  # 1 MB
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_BYTES:
+                    raise HTTPException(413, "Arquivo muito grande")
+                tmp_file.write(chunk)
             tmp_path = tmp_file.name
+
+            # tmp_file.write(content)
+            # tmp_path = tmp_file.name
         
         # Processa o PDF e extrai os dados
         out = process_pdf(tmp_path)
