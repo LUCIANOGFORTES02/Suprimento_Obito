@@ -75,10 +75,10 @@ class PDFContext:
     pdf_path: str
     _pdf: pdfplumber.PDF = field(init=False)
     pages_text: list[str] = field(init=False)
-    _img_cache_300:dict[int, "Image.Image"] = field(init=False, default_factory=dict)
-    _img_cache_400:dict[int, "Image.Image"] = field(init=False, default_factory=dict)
+    _img_cache:dict[int, "Image.Image"] = field(init=False, default_factory=dict)
     _footer_text_cache: dict[int, str] = field(default_factory=dict, init=False)
 
+    #Abre o PDF com pdfplumber e extrai o texto vetorial de todas as páginas para pages_text.
     def __post_init__(self):
         self.pdf = pdfplumber.open(self.pdf_path)
         self.pages_text = []
@@ -99,25 +99,29 @@ class PDFContext:
             pass
 
     # ---------- Raster/OCR ----------
+    #Chama convert_from_path para várias páginas de uma vez que devolve uma lista de imagens PIL.
     def _batch_raster_and_ocr(self, page_indices: list[int], dpi: int):
         if not page_indices:
             return
-        first = min(page_indices) + 1
-        last  = max(page_indices) + 1
-        pages = convert_from_path(self.pdf_path, dpi=dpi, first_page=first, last_page=last)
-        start = min(page_indices)
-        for offset, img in enumerate(pages):
-            idx = start + offset
-            if idx in page_indices:
-                if dpi == 300:
-                    self._img_cache_300[idx] = img
-                else:
-                    self._img_cache_400[idx] = img
-                if len(normalize_spaces(self.pages_text[idx]).split()) < SHORT_TEXT_WORDS:
-                    self.pages_text[idx] = image_to_string(img, lang="por") or self.pages_text[idx]
+        for i in page_indices:
+            pages = convert_from_path(
+                self.pdf_path,
+                dpi=dpi,
+                first_page=i+1,
+                last_page=i+1,
+                fmt="jpeg",              # menor memória
+                thread_count=1,
+                use_pdftocairo=True
+            )
+            if not pages:
+                continue
+            img = pages[0].convert("L")  # grayscale
+            if len(normalize_spaces(self.pages_text[i]).split()) < SHORT_TEXT_WORDS:
+                self.pages_text[i] = image_to_string(img, lang="por", config="--oem 1 --psm 6") or self.pages_text[i]
+            del img
     
     def _get_page_image(self, i: int, dpi: int):
-        cache = self._img_cache_400 if dpi >= 400 else self._img_cache_300
+        cache = self._img_cache if dpi >= 400 else self._img_cache
         if i not in cache:
             pages = convert_from_path(self.pdf_path, dpi=dpi, first_page=i+1, last_page=i+1)
             if pages:
@@ -125,18 +129,31 @@ class PDFContext:
         return cache.get(i)
        
     def ocr_region(self, i: int, frac_top: float, frac_bottom: float, dpi: int, psm: int = 6) -> str:
-        img = self._get_page_image(i, dpi=dpi)
-        if img is None:
+        pages = convert_from_path(
+            self.pdf_path,
+            dpi=dpi,
+            first_page=i+1,
+            last_page=i+1,
+            fmt="jpeg",
+            thread_count=1,
+            use_pdftocairo=True
+    )
+        if not pages:
             return ""
+        img = pages[0].convert("L")
         w, h = img.size
         y0 = int(h * frac_top)
         y1 = int(h * (1.0 - frac_bottom))
         crop = img.crop((0, y0, w, y1))
-        return image_to_string(crop, lang="por", config=f"--oem 1 --psm {psm}") or ""
+        txt = image_to_string(crop, lang="por", config=f"--oem 1 --psm {psm}") or ""
+        del crop, img
+        return 
     
+    
+    #Chamam OCR na região do cabeçalho
     def ocr_header(self, i: int, frac: float = HEADER_FRAC) -> str:
         return self.ocr_region(i, 0.0, 1.0-frac, dpi=OCR_DPI_HEADER, psm=6)
-
+    #Chamam OCR na região do rodapé
     def ocr_footer(self, i: int, frac: float = FOOTER_FRAC) -> str:
         return self.ocr_region(i, 1.0-frac, 0.0, dpi=OCR_DPI_FOOTER, psm=6)
 
@@ -538,19 +555,19 @@ RE_DO_HEADER   = re.compile(r"\bdeclara[cç][aã]o\s+de\s+[óo]bito\b", re.IGNOR
 RE_NASC_HEADER = re.compile(r"\bcertid[aã]o\s+de\s+nascimento\b", re.IGNORECASE)
 RE_RCNP        = re.compile(r"registro\s+civil\s+das\s+pessoas\s+naturais", re.IGNORECASE)
 
-def _has_do_header(ctx: PDFContext, i: int, frac: float = 0.42) -> bool:
-    """True se o topo da página (OCR) ou o texto extraído contiver 'Declaração de Óbito'."""
-    head_ocr = ctx.ocr_header(i, frac=frac) or ""
-    if RE_DO_HEADER.search(head_ocr):
-        return True
-    # fallback: às vezes o pdf tem texto vetorial e o pdfplumber já pegou
-    return RE_DO_HEADER.search(ctx.pages_text[i] or "") is not None
+# def _has_do_header(ctx: PDFContext, i: int, frac: float = 0.42) -> bool:
+#     """True se o topo da página (OCR) ou o texto extraído contiver 'Declaração de Óbito'."""
+#     head_ocr = ctx.ocr_header(i, frac=frac) or ""
+#     if RE_DO_HEADER.search(head_ocr):
+#         return True
+#     # fallback: às vezes o pdf tem texto vetorial e o pdfplumber já pegou
+#     return RE_DO_HEADER.search(ctx.pages_text[i] or "") is not None
 
-def _is_certidao_nascimento(ctx: PDFContext, i: int, frac: float = 0.42) -> bool:
-    """True se o topo indicar 'Certidão de Nascimento' (evita falsos positivos)."""
-    head_ocr = ctx.ocr_header(i, frac=frac) or ""
-    sniff = (head_ocr + " " + (ctx.pages_text[i] or "")[:500]).lower()
-    return bool(RE_NASC_HEADER.search(sniff) or RE_RCNP.search(sniff))
+# def _is_certidao_nascimento(ctx: PDFContext, i: int, frac: float = 0.42) -> bool:
+#     """True se o topo indicar 'Certidão de Nascimento' (evita falsos positivos)."""
+#     head_ocr = ctx.ocr_header(i, frac=frac) or ""
+#     sniff = (head_ocr + " " + (ctx.pages_text[i] or "")[:500]).lower()
+#     return bool(RE_NASC_HEADER.search(sniff) or RE_RCNP.search(sniff))
 
 def extract_id_declaracao_avancado(ctx: PDFContext) -> typing.Optional[str]:
     candidatas = []
@@ -714,7 +731,7 @@ def montar_resultado(ctx: PDFContext) -> dict:
 
 
 # -------------------------
-# Função para ler o arquivo PDF e retornar os dados extraídos
+# Cria um PDFContext e no finally fecha o PDF
 # -------------------------
 def process_pdf(pdf_path: str) -> dict:
     ctx = PDFContext(pdf_path)
