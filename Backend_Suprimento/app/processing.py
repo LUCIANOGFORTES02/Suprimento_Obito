@@ -282,11 +282,41 @@ def _canon_grau(s: str) -> str:
 def _is_non_kin(g: str) -> bool:
     return _canon_grau(g) in NON_KIN
 
+# ---- Detectores de sexo do falecido (melhorados) ----
+RE_FEM_LOCAL = re.compile(r"\b(falecida|nascida|vi[uú]va|esposa|senhora|sra\.?)\b", re.IGNORECASE)
+RE_MASC_LOCAL = re.compile(r"\b(falecido|nascido|vi[uú]vo|esposo|marido|senhor|sr\.?)\b", re.IGNORECASE)
+
 def _sexo_falecido(texto: str) -> typing.Optional[str]:
     """Tenta inferir sexo do falecido com base em 'falecido/falecida'."""
     t = lower_noacc(texto or "")
     if re.search(r"\bfalecida\b", t): return "F"
     if re.search(r"\bfalecido\b", t): return "M"
+    return None
+def infer_sexo_falecido(texto: str,
+                        nome_span: typing.Optional[tuple[int, int]] = None,
+                        window: int = 180) -> typing.Optional[str]:
+    """
+    Tenta inferir sexo do falecido priorizando o contexto logo após o NOME.
+    Retorna "F", "M" ou None.
+    """
+    t = texto or ""
+    zonas: list[str] = []
+
+    if nome_span:
+        ini, fim = nome_span
+        ini_ctx = max(0, ini - 40)      # pega um pouco antes do nome
+        fim_ctx = min(len(t), fim + window)
+        zonas.append(t[ini_ctx:fim_ctx])
+
+    # fallback: documento todo
+    zonas.append(t)
+
+    for z in zonas:
+        zl = lower_noacc(z)
+        if RE_FEM_LOCAL.search(zl):
+            return "F"
+        if RE_MASC_LOCAL.search(zl):
+            return "M"
     return None
 
 def _choose_by_sex(neutral: str, sexo: typing.Optional[str]) -> str:
@@ -314,102 +344,87 @@ def _choose_by_sex(neutral: str, sexo: typing.Optional[str]) -> str:
 
 def invert_parentesco_requerente_para_falecido(grau_requerente: str,
                                                sexo_falecido: typing.Optional[str]=None) -> typing.Optional[str]:
-    """
-    Transforma 'grau do requerente em relação ao falecido' 
-    em 'grau do falecido em relação ao requerente'.
-    Exemplos:
-      mãe  -> filho(a)
-      pai  -> filho(a)
-      filho/filha -> genitor(a)
-      avó/avô -> neto(a)
-      neto/neta -> avô/avó
-      tio/tia -> sobrinho(a)
-      sobrinho/sobrinha -> tio/tia
-      sogro/sogra <-> genro/nora
-      padrasto/madrasta <-> enteado(a)
-      cônjuge/companheiro(a)/marido/mulher -> cônjuge
-      viúvo/viúva -> cônjuge
-      tutor(a) <-> tutelado(a)
-      cunhado(a) -> cunhado(a)
-    """
     g = _canon_grau(grau_requerente)
 
-    # Mapear várias formas para chaves canônicas
-    # (use prefixos/sinônimos simples para robustez)
-    def is_any(s: str, *alts: str) -> bool:
-        return g in alts
+    def is_any(*alts: str) -> bool:
+        return g in { _canon_grau(a) for a in alts }
 
-    # inversão (resultado neutro; depois ajustamos por sexo)
-    if is_any(g, "pai","mae","mãe"):
+    if is_any("pai","mãe","mae"):
         neutral = "filho(a)"
-    elif is_any(g, "filho","filha"):
-        neutral = "genitor(a)"
-    elif is_any(g, "avo","avô","avo","avó"):
+    elif is_any("filho","filha"):
+        # aqui escolhemos pai/mãe (não "genitor(a)")
+        if sexo_falecido == "M":
+            return "pai"
+        elif sexo_falecido == "F":
+            return "mãe"
+        else:
+            return "pai/mãe"
+    elif is_any("avô","avo","avó","avo"):
         neutral = "neto(a)"
-    elif is_any(g, "bisavo","bisavô","bisavo","bisavó"):
+    elif is_any("bisavô","bisavo","bisavó","bisavo"):
         neutral = "bisneto(a)"
-    elif is_any(g, "tataravo","tataravô","tataravo","tataravó"):
+    elif is_any("tataravô","tataravo","tataravó","tataravo"):
         neutral = "tataraneto(a)"
-    elif is_any(g, "neto","neta"):
+    elif is_any("neto","neta"):
         neutral = "avô/avó"
-    elif is_any(g, "bisneto","bisneta"):
+    elif is_any("bisneto","bisneta"):
         neutral = "bisavô/avó"
-    elif is_any(g, "tataraneto","tataraneta"):
+    elif is_any("tataraneto","tataraneta"):
         neutral = "tataravô/avó"
-    elif is_any(g, "irma","irmã","irmao","irmão"):
+    elif is_any("irmão","irmao","irmã","irma"):
         neutral = "irmão(ã)"
-    elif is_any(g, "tio","tia"):
+    elif is_any("tio","tia"):
         neutral = "sobrinho(a)"
-    elif is_any(g, "sobrinho","sobrinha"):
+    elif is_any("sobrinho","sobrinha"):
         neutral = "tio/tia"
-    elif is_any(g, "sogro","sogra"):
+    elif is_any("sogro","sogra"):
         neutral = "genro/nora"
-    elif is_any(g, "genro","nora"):
+    elif is_any("genro","nora"):
         neutral = "sogro(a)"
-    elif is_any(g, "padrasto","madrasta"):
+    elif is_any("padrasto","madrasta"):
         neutral = "enteado(a)"
-    elif is_any(g, "enteado","enteada"):
+    elif is_any("enteado","enteada"):
         neutral = "padrasto/madrasta"
-    elif is_any(g, "companheiro","companheira","convivente","conjuge","cônjuge","esposo","esposa","marido","mulher","viuvo","viúva","viuvo","viuva"):
+    elif is_any("companheiro","companheira","convivente",
+                "cônjuge","conjuge","esposo","esposa","marido","mulher",
+                "viúvo","viuvo","viúva","viuva"):
         neutral = "cônjuge"
-    elif is_any(g, "tutor","tutora"):
+    elif is_any("tutor","tutora"):
         neutral = "tutelado(a)"
-    elif is_any(g, "tutelado","tutelada"):
+    elif is_any("tutelado","tutelada"):
         neutral = "tutor(a)"
-    elif is_any(g, "cunhado","cunhada"):
+    elif is_any("cunhado","cunhada"):
         neutral = "cunhado(a)"
     else:
-        # desconhecido ou não parentesco
         return None
 
     return _choose_by_sex(neutral, sexo_falecido)
 
 
-# def extract_parentesco_e_falecido(text: str) -> tuple[typing.Optional[str], typing.Optional[str]]:
-#     t = normalize_spaces(text)
-#     for rx in (RE_PARENTESCO_NOME_UPPER, RE_PARENTESCO_NOME_TITLE, RE_PARENTESCO_FALLBACK):
-#         m = rx.search(t)
-#         if m:
-#             grau = m.group("grau").lower()
-#             nome = m.group("nome").strip()
-#             return grau, nome
-#     return None, None
 def extract_parentesco_e_falecido(text: str) -> tuple[typing.Optional[str], typing.Optional[str]]:
     """
-    Retorna: (grau_do_falecido_em_relacao_ao_requerente, nome_do_falecido)
-    Se não achar, (None, None).
+    Retorna (grau_do_falecido_em_relacao_ao_requerente, nome_do_falecido)
     """
     t = normalize_spaces(text)
-    sexo = _sexo_falecido(t)
 
-    # use finditer para poder pular matches não-kin
+    # loopa pelos padrões em ordem de confiança
     for rx in (RE_PARENTESCO_NOME_UPPER, RE_PARENTESCO_NOME_TITLE, RE_PARENTESCO_FALLBACK):
         for m in rx.finditer(t):
             grau_req = m.group("grau").lower()
             if _is_non_kin(grau_req):
-                continue  # ignora inventariante, herdeiro, etc.
+                continue
+
             nome = m.group("nome").strip()
-            grau_fal = invert_parentesco_requerente_para_falecido(grau_req, sexo_falecido=sexo)
+
+            # >>> sexo do falecido priorizando o contexto do nome
+            sexo_local = infer_sexo_falecido(t, nome_span=m.span("nome"))
+            if not sexo_local:
+                # fallback global (ex.: "… falecida …" em outro ponto)
+                sexo_local = _sexo_falecido(t)
+
+            grau_fal = invert_parentesco_requerente_para_falecido(
+                grau_req, sexo_falecido=sexo_local
+            )
             if grau_fal:
                 return grau_fal, nome
 
