@@ -36,19 +36,6 @@ def strip_accents(s: str) -> str:
 def lower_noacc(s: str) -> str:
     return strip_accents((s or '').lower())
 
-def titlecase_nome(s: typing.Optional[str]) -> typing.Optional[str]:
-    """
-    Coloca apenas a primeira letra de cada palavra em maiúscula.
-    Ex.: 'FABYANY WALTENIZY RODRIGUES DA SILVA' -> 'Fabyany Waltenizy Rodrigues Da Silva'
-    Mantém hífens corretamente: 'SANTOS-FILHO' -> 'Santos-Filho'
-    """
-    if not s:
-        return s
-    s = normalize_spaces(s)
-    # aplica capitalização sem perder hífens
-    def cap_token(tok: str) -> str:
-        return "-".join(p.capitalize() for p in tok.split("-"))
-    return " ".join(cap_token(tok) for tok in s.lower().split())
 
 def fix_local_obito_uf(local: typing.Optional[str]) -> typing.Optional[str]:
     """
@@ -241,7 +228,7 @@ RE_PARENTESCO = r"""
     padrasto|madrasta|entead[oa]|
     companheir[ao]|convivent[ea]|
     c[oô]njuge|espos[ao]|marido|mulher|
-    vi[uú]v[ao]
+    vi[uú]v[ao]|
     adotiv[ao]|                       
     tutelad[ao]|                      
     tutor|tutora| herdeir[ao]|
@@ -250,6 +237,14 @@ RE_PARENTESCO = r"""
     )
 \s+d[aeo]s?\s+                       # de / do / da / dos / das
 (?:falecid[oa]\s+|sr\.?\s+|sra\.?\s+|de\s+cujus\s+)?   # opcional
+"""
+
+# --- NOVO: padrão ancorado em "requerente é (grau) de (NOME)" ---
+RE_GRAU_TERMO = r"""
+    filh[ao]|pai|m[ãa]e|av[óô]|bisav[óô]|tatarav[óô]|net[oa]|bisnet[oa]|
+    irm[ãa]o|ti[oa]|sobrinh[ao]|prim[oa]|sogr[oa]|genr[eo]|nora|cunhad[oa]|
+    padrasto|madrasta|entead[oa]|companheir[ao]|convivent[ea]|
+    c[oô]njuge|espos[ao]|marido|mulher|vi[uú]v[ao]|tutor|tutora|tutelad[oa]
 """
 
 RE_NOME_UPPER = r"""
@@ -272,17 +267,153 @@ RE_PARENTESCO_FALLBACK = re.compile(
     RE_PARENTESCO + r".{0,10}?d[aeo]s?\s+" + RE_NOME_UPPER,
     re.IGNORECASE | re.VERBOSE | re.DOTALL
 )
+# --- Helpers de parentesco ---
 
+NON_KIN = {
+    "herdeiro","herdeira","testamenteiro","testamenteira",
+    "inventariante","representante","responsavel","responsável",
+    "adotivo","adotiva"  # 'adotivo' isolado não é grau; ex.: "filho adotivo" já é coberto por 'filho'
+}
+
+def _canon_grau(s: str) -> str:
+    """Normaliza para comparação (sem acento/minúsculo)."""
+    return lower_noacc(normalize_spaces(s))
+
+def _is_non_kin(g: str) -> bool:
+    return _canon_grau(g) in NON_KIN
+
+def _sexo_falecido(texto: str) -> typing.Optional[str]:
+    """Tenta inferir sexo do falecido com base em 'falecido/falecida'."""
+    t = lower_noacc(texto or "")
+    if re.search(r"\bfalecida\b", t): return "F"
+    if re.search(r"\bfalecido\b", t): return "M"
+    return None
+
+def _choose_by_sex(neutral: str, sexo: typing.Optional[str]) -> str:
+    """Converte marcas neutras para M/F quando possível."""
+    if not sexo:
+        return neutral
+    sub = {
+        "filho(a)":  {"M": "filho", "F": "filha"},
+        "neto(a)":   {"M": "neto",  "F": "neta"},
+        "bisneto(a)":{"M": "bisneto","F": "bisneta"},
+        "tataraneto(a)": {"M": "tataraneto", "F": "tataraneta"},
+        "irmão(ã)": {"M": "irmão", "F": "irmã"},
+        "tio/tia":  {"M": "tio",   "F": "tia"},
+        "genro/nora":{"M": "genro","F": "nora"},
+        "sogro(a)": {"M": "sogro","F": "sogra"},
+        "padrasto/madrasta":{"M": "padrasto","F": "madrasta"},
+        "tutor(a)": {"M": "tutor","F": "tutora"},
+        "tutelado(a)": {"M": "tutelado","F": "tutelada"},
+        "avô/avó":  {"M": "avô",   "F": "avó"},
+        "bisavô/avó":{"M": "bisavô","F": "bisavó"},
+        "tataravô/avó":{"M": "tataravô","F": "tataravó"},
+        "cônjuge":  {"M": "cônjuge","F": "cônjuge"},  # neutro mesmo
+    }
+    return sub.get(neutral, {}).get(sexo, neutral)
+
+def invert_parentesco_requerente_para_falecido(grau_requerente: str,
+                                               sexo_falecido: typing.Optional[str]=None) -> typing.Optional[str]:
+    """
+    Transforma 'grau do requerente em relação ao falecido' 
+    em 'grau do falecido em relação ao requerente'.
+    Exemplos:
+      mãe  -> filho(a)
+      pai  -> filho(a)
+      filho/filha -> genitor(a)
+      avó/avô -> neto(a)
+      neto/neta -> avô/avó
+      tio/tia -> sobrinho(a)
+      sobrinho/sobrinha -> tio/tia
+      sogro/sogra <-> genro/nora
+      padrasto/madrasta <-> enteado(a)
+      cônjuge/companheiro(a)/marido/mulher -> cônjuge
+      viúvo/viúva -> cônjuge
+      tutor(a) <-> tutelado(a)
+      cunhado(a) -> cunhado(a)
+    """
+    g = _canon_grau(grau_requerente)
+
+    # Mapear várias formas para chaves canônicas
+    # (use prefixos/sinônimos simples para robustez)
+    def is_any(s: str, *alts: str) -> bool:
+        return g in alts
+
+    # inversão (resultado neutro; depois ajustamos por sexo)
+    if is_any(g, "pai","mae","mãe"):
+        neutral = "filho(a)"
+    elif is_any(g, "filho","filha"):
+        neutral = "genitor(a)"
+    elif is_any(g, "avo","avô","avo","avó"):
+        neutral = "neto(a)"
+    elif is_any(g, "bisavo","bisavô","bisavo","bisavó"):
+        neutral = "bisneto(a)"
+    elif is_any(g, "tataravo","tataravô","tataravo","tataravó"):
+        neutral = "tataraneto(a)"
+    elif is_any(g, "neto","neta"):
+        neutral = "avô/avó"
+    elif is_any(g, "bisneto","bisneta"):
+        neutral = "bisavô/avó"
+    elif is_any(g, "tataraneto","tataraneta"):
+        neutral = "tataravô/avó"
+    elif is_any(g, "irma","irmã","irmao","irmão"):
+        neutral = "irmão(ã)"
+    elif is_any(g, "tio","tia"):
+        neutral = "sobrinho(a)"
+    elif is_any(g, "sobrinho","sobrinha"):
+        neutral = "tio/tia"
+    elif is_any(g, "sogro","sogra"):
+        neutral = "genro/nora"
+    elif is_any(g, "genro","nora"):
+        neutral = "sogro(a)"
+    elif is_any(g, "padrasto","madrasta"):
+        neutral = "enteado(a)"
+    elif is_any(g, "enteado","enteada"):
+        neutral = "padrasto/madrasta"
+    elif is_any(g, "companheiro","companheira","convivente","conjuge","cônjuge","esposo","esposa","marido","mulher","viuvo","viúva","viuvo","viuva"):
+        neutral = "cônjuge"
+    elif is_any(g, "tutor","tutora"):
+        neutral = "tutelado(a)"
+    elif is_any(g, "tutelado","tutelada"):
+        neutral = "tutor(a)"
+    elif is_any(g, "cunhado","cunhada"):
+        neutral = "cunhado(a)"
+    else:
+        # desconhecido ou não parentesco
+        return None
+
+    return _choose_by_sex(neutral, sexo_falecido)
+
+
+# def extract_parentesco_e_falecido(text: str) -> tuple[typing.Optional[str], typing.Optional[str]]:
+#     t = normalize_spaces(text)
+#     for rx in (RE_PARENTESCO_NOME_UPPER, RE_PARENTESCO_NOME_TITLE, RE_PARENTESCO_FALLBACK):
+#         m = rx.search(t)
+#         if m:
+#             grau = m.group("grau").lower()
+#             nome = m.group("nome").strip()
+#             return grau, nome
+#     return None, None
 def extract_parentesco_e_falecido(text: str) -> tuple[typing.Optional[str], typing.Optional[str]]:
+    """
+    Retorna: (grau_do_falecido_em_relacao_ao_requerente, nome_do_falecido)
+    Se não achar, (None, None).
+    """
     t = normalize_spaces(text)
-    for rx in (RE_PARENTESCO_NOME_UPPER, RE_PARENTESCO_NOME_TITLE, RE_PARENTESCO_FALLBACK):
-        m = rx.search(t)
-        if m:
-            grau = m.group("grau").lower()
-            nome = m.group("nome").strip()
-            return grau, nome
-    return None, None
+    sexo = _sexo_falecido(t)
 
+    # use finditer para poder pular matches não-kin
+    for rx in (RE_PARENTESCO_NOME_UPPER, RE_PARENTESCO_NOME_TITLE, RE_PARENTESCO_FALLBACK):
+        for m in rx.finditer(t):
+            grau_req = m.group("grau").lower()
+            if _is_non_kin(grau_req):
+                continue  # ignora inventariante, herdeiro, etc.
+            nome = m.group("nome").strip()
+            grau_fal = invert_parentesco_requerente_para_falecido(grau_req, sexo_falecido=sexo)
+            if grau_fal:
+                return grau_fal, nome
+
+    return None, None
 
 # =========================
 # Local do óbito + Data ------------------------
@@ -555,19 +686,6 @@ RE_DO_HEADER   = re.compile(r"\bdeclara[cç][aã]o\s+de\s+[óo]bito\b", re.IGNOR
 RE_NASC_HEADER = re.compile(r"\bcertid[aã]o\s+de\s+nascimento\b", re.IGNORECASE)
 RE_RCNP        = re.compile(r"registro\s+civil\s+das\s+pessoas\s+naturais", re.IGNORECASE)
 
-# def _has_do_header(ctx: PDFContext, i: int, frac: float = 0.42) -> bool:
-#     """True se o topo da página (OCR) ou o texto extraído contiver 'Declaração de Óbito'."""
-#     head_ocr = ctx.ocr_header(i, frac=frac) or ""
-#     if RE_DO_HEADER.search(head_ocr):
-#         return True
-#     # fallback: às vezes o pdf tem texto vetorial e o pdfplumber já pegou
-#     return RE_DO_HEADER.search(ctx.pages_text[i] or "") is not None
-
-# def _is_certidao_nascimento(ctx: PDFContext, i: int, frac: float = 0.42) -> bool:
-#     """True se o topo indicar 'Certidão de Nascimento' (evita falsos positivos)."""
-#     head_ocr = ctx.ocr_header(i, frac=frac) or ""
-#     sniff = (head_ocr + " " + (ctx.pages_text[i] or "")[:500]).lower()
-#     return bool(RE_NASC_HEADER.search(sniff) or RE_RCNP.search(sniff))
 
 def extract_id_declaracao_avancado(ctx: PDFContext) -> typing.Optional[str]:
     candidatas = []
@@ -715,9 +833,9 @@ def montar_resultado(ctx: PDFContext) -> dict:
 
     resultado = {
         "numero_processo": extract_numero_processo(full_text),
-        "requerente":      titlecase_nome(req_raw),
+        "requerente":      req_raw,
         "parentesco":      par,
-        "nome_falecido":   titlecase_nome(fal),
+        "nome_falecido":   fal,
         "local_obito":     fix_local_obito_uf(loc_raw),
         "data":            extract_data_obito(full_text),
         "id_parecer":      extract_id_parecer(full_text),
