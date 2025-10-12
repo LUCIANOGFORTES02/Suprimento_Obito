@@ -74,8 +74,6 @@ async def upload(file: UploadFile = File(...)):
                 tmp_file.write(chunk)
             tmp_path = tmp_file.name
 
-            # tmp_file.write(content)
-            # tmp_path = tmp_file.name
         
         # Processa o PDF e extrai os dados
         out = process_pdf(tmp_path)

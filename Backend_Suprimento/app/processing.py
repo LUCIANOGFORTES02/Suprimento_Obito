@@ -96,6 +96,7 @@ class PDFContext:
                 dpi=dpi,
                 first_page=i+1,
                 last_page=i+1,
+                grayscale = True,
                 fmt="jpeg",              # menor memória
                 thread_count=1,
                 use_pdftocairo=True
@@ -121,6 +122,7 @@ class PDFContext:
             dpi=dpi,
             first_page=i+1,
             last_page=i+1,
+            grayscale = True,
             fmt="jpeg",
             thread_count=1,
             use_pdftocairo=True
@@ -134,7 +136,7 @@ class PDFContext:
         crop = img.crop((0, y0, w, y1))
         txt = image_to_string(crop, lang="por", config=f"--oem 1 --psm {psm}") or ""
         del crop, img
-        return 
+        return txt
     
     
     #Chamam OCR na região do cabeçalho
